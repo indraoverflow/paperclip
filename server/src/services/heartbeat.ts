@@ -16356,7 +16356,13 @@ export function heartbeatService(
       cutoff,
     });
     applyRunDispatchPostCommitEffects(result.postCommitEffects);
-    return { promoted: result.promoted, runIds: result.runIds };
+    // Per-decision release/defer report for this sweep. A bounded release that
+    // is not visible is not verifiable, and "which retry was held back and why"
+    // is unanswerable after the fact without this trail.
+    for (const line of result.logLines) {
+      logger.info(line, "run-dispatch.scheduled_retry_sweep");
+    }
+    return { promoted: result.promoted, runIds: result.runIds, deferred: result.deferred };
   }
 
   async function getIssueRetryRun(

@@ -1,3 +1,4 @@
+import { decorrelateRetryAt } from "../../modules/run-dispatch/index.js";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
@@ -525,6 +526,15 @@ const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
+
+/**
+ * Width of the enqueue-time decorrelation window. Without it every retry
+ * enqueued during one provider incident becomes due at the same instant one
+ * base-backoff later, so the backoff re-synchronises exactly the cohort it just
+ * de-synchronised — a recovered provider is hit by N concurrent requests at
+ * once instead of a trickle.
+ */
+export const PROVIDER_QUOTA_RECOVERY_DECORRELATION_WINDOW_MS = 30 * 60 * 1000;
 
 const PROVIDER_QUOTA_ERROR_RE =
   /(?:you(?:'|’)ve hit your (?:\w+ )?limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
@@ -2575,6 +2585,23 @@ export function recoveryService(
     return action;
   }
 
+  /**
+   * Stable seed for one recovery's enqueue-time decorrelation.
+   *
+   * Derived from immutable identifiers rather than the clock so the same
+   * recovery always lands in the same slot: a retry that moved every time it was
+   * recomputed would defeat the purpose, and a non-reproducible release plan
+   * cannot be regression-tested.
+   */
+  function providerQuotaRetryAtSeed(latestRun: LatestIssueRun): number {
+    const key = latestRun?.id ?? "no-run";
+    let hash = 0;
+    for (let i = 0; i < key.length; i += 1) {
+      hash = (Math.imul(hash, 31) + key.charCodeAt(i)) | 0;
+    }
+    return Math.abs(hash);
+  }
+
   function readProviderQuotaRetryAt(latestRun: LatestIssueRun, now: Date) {
     const result = parseObject(latestRun?.resultJson);
     const context = parseObject(latestRun?.contextSnapshot);
@@ -2593,7 +2620,19 @@ export function recoveryService(
       if (!Number.isNaN(parsed.getTime()) && parsed.getTime() > now.getTime())
         return parsed;
     }
-    return new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS);
+    // A flat offset re-synchronises every retry enqueued during the same
+    // incident: the whole backlog comes due in the same minute an hour later.
+    // Spread the fallback over a window instead, drawn from a stream seeded by
+    // the run and agent, so the spread is per-cohort and reproducible. A caller
+    // that already knows the provider's reset time still wins above — this only
+    // governs the fallback.
+    return decorrelateRetryAt({
+      createdAt: now,
+      seed: providerQuotaRetryAtSeed(latestRun),
+      cohortKey: String(latestRun?.agentId ?? "unknown-agent"),
+      baseBackoffMs: PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
+      windowMs: PROVIDER_QUOTA_RECOVERY_DECORRELATION_WINDOW_MS,
+    });
   }
 
   async function ensureProviderQuotaWaitRecoveryMonitor(input: {

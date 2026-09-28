@@ -1,7 +1,7 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
-import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, count, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -35,6 +35,7 @@ import {
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
+import { QUOTA_RECOVERY_RETRY_REASON } from "../domain/quota-recovery-release.js";
 import type {
   QueuedRunFacts,
   ReviewParticipantFacts,
@@ -52,6 +53,8 @@ import type {
   CancelStaleQueuedRunInput,
   DispatchResolvedInteractionInput,
   DispatchResolvedInteractionOutcome,
+  CountInflightQuotaRecoveryRetriesInput,
+  DeferScheduledRetryInput,
   DueRetryRun,
   EvaluateScheduledRetryGateInput,
   ListDueRetriesInput,
@@ -499,7 +502,60 @@ export function createPostgresRunDispatchAdapter(
     return rows.map((row) => ({
       runId: row.id,
       companyId: row.companyId,
+      agentId: row.agentId,
+      retryReason: row.scheduledRetryReason ?? null,
     }));
+  }
+
+  /**
+   * Per-agent count of quota-recovery retries already released and not yet
+   * finished — promoted into `queued` or `running`. These are the releases the
+   * cap has to account for, so a retry admitted by an earlier sweep is not
+   * admitted again while it is still going.
+   *
+   * Resolves to `null` on any read failure. The caller treats `null` as "state
+   * unavailable" and denies the sweep: a drain that assumes zero in-flight under
+   * an unreadable input fails open exactly when the control plane is already
+   * unhealthy, which is the only moment the cap matters.
+   */
+  async function countInflightQuotaRecoveryRetries(
+    _input: CountInflightQuotaRecoveryRetriesInput,
+  ): Promise<ReadonlyMap<string, number> | null> {
+    try {
+      const rows = await db
+        .select({ agentId: heartbeatRuns.agentId, inflight: count() })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.scheduledRetryReason, QUOTA_RECOVERY_RETRY_REASON),
+            inArray(heartbeatRuns.status, ["queued", "running"]),
+          ),
+        )
+        .groupBy(heartbeatRuns.agentId);
+      return new Map(rows.map((row) => [row.agentId, Number(row.inflight)]));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Push a held-back retry forward. Guarded on `scheduled_retry` so a row that a
+   * concurrent writer promoted or cancelled reports `deferred: false` instead of
+   * being silently resurrected.
+   */
+  async function deferScheduledRetry(input: DeferScheduledRetryInput) {
+    const rows = await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAt: input.releaseAt, updatedAt: input.now })
+      .where(
+        and(
+          eq(heartbeatRuns.id, input.runId),
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+        ),
+      )
+      .returning({ id: heartbeatRuns.id });
+    return { deferred: rows.length > 0 };
   }
 
   async function loadStalenessFacts(
@@ -1075,6 +1131,8 @@ export function createPostgresRunDispatchAdapter(
   return {
     evaluateScheduledRetryGate,
     listDueRetries,
+    countInflightQuotaRecoveryRetries,
+    deferScheduledRetry,
     cancelStaleQueuedRun,
     dispatchResolvedInteractionIfCurrent,
     promoteOrCancelDueRetry,
