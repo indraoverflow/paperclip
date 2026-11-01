@@ -189,7 +189,7 @@
   "devDependencies": {
     "@paperclipai/paperclip-eval-kernel": "workspace:*",
     "@playwright/test": "^1.61.1",
-    "@types/node": "^24.0.0",
+    "@types/node": "^24.19.2",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.5",
     "@vitejs/plugin-react": "^4.7.0",
