@@ -85,7 +85,7 @@
     "embedded-postgres": "^18.1.0-beta.16",
     "express": "^5.1.0",
     "heif2jpeg": "0.1.6",
-    "jsdom": "^30.0.1",
+    "jsdom": "^30.1.3",
     "multer": "^2.2.0",
     "nice-grpc": "2.1.17",
     "nice-grpc-common": "2.0.4",
